@@ -1,0 +1,9 @@
+# Use glob syntax
+syntax: glob
+
+*.pyc
+*.DS_Store
+tests/heat/test
+tests/wave/test
+tests/airy/test
+tests/cgle/test
