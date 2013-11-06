@@ -4,7 +4,7 @@ import numpy as np
 
 # Bottom of module:
 # # Import after definitions to resolve cyclic dependencies
-# from .field import field_manager, Field
+# from .field import Field
 
 
 class Operator:
@@ -119,7 +119,7 @@ class Operator:
         if self.out:
             out = self.out
         else:
-            out = field_manager.get_field(self.domain)
+            out = self.domain.new_field()
 
         # Set output layout to argument layout
         out.layout = layout
@@ -221,7 +221,7 @@ class Multiplication(Arithmetic):
         flag = True
         for a in self.args:
             if isinstance(a, Field):
-                if 'k' in a.space:
+                if not all(a.layout.grid_space):
                     flag = False
         return flag
 
@@ -251,9 +251,9 @@ def create_diff_operators(domain):
                 flag = True
                 for a in self.args:
                     if isinstance(a, Field):
-                        if a.space[self.index] == 'x':
+                        if a.layout.grid_space[self.index]:
                             flag = False
-                        if not a.local[self.index]:
+                        if not a.layout.local[self.index]:
                             flag = False
                 return flag
 
@@ -282,7 +282,7 @@ class MagSquared(Operator):
         flag = True
         for a in self.args:
             if isinstance(a, Field):
-                if 'k' in a.space:
+                if not all(a.layout.grid_space):
                     flag = False
         return flag
 
@@ -296,7 +296,7 @@ class MagSquared(Operator):
 def unique_domain(fields):
 
     # Get set of domains
-    domains = set(f.domain for f in fields)
+    domains = set(f.domain() for f in fields)
 
     # Return domain if unique
     if len(domains) == 1:
@@ -320,5 +320,5 @@ def unique_layout(fields):
 
 
 # Import after definitions to resolve cyclic dependencies
-from .field import field_manager, Field
+from .field import Field
 

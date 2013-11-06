@@ -6,7 +6,7 @@ from scipy import sparse
 from scipy.sparse import linalg
 
 from ..data.system import System
-from ..data.pencil import Pencil
+from ..data.pencil import PencilSet
 
 
 class Integrator:
@@ -22,16 +22,14 @@ class Integrator:
         self.state = System(problem.field_names, domain)
         self.rhs = System(problem.field_names, domain)
 
-        # Build pencils
-        self.pencils = []
+        # Build pencilset and pencil matrices
+        self.pencilset = PencilSet(domain, problem.size)
         primary_basis = domain.bases[-1]
-        for s, d in zip(domain.slices, domain.d_list):
-            pencil = Pencil(s, d)
+        for pencil in self.pencilset.pencils:
             pencil.build_matrices(problem, primary_basis)
-            self.pencils.append(pencil)
 
         # Initialize timestepper
-        self.timestepper = timestepper(self.pencils, self.state, self.rhs)
+        self.timestepper = timestepper(self.pencilset, self.state, self.rhs)
 
         # Integration parameters
         self.dt = 0.01
@@ -69,14 +67,15 @@ class Integrator:
         # Update pencil arrays
         self.timestepper.update_pencils(dt, self.iteration)
 
-        for pencil in self.pencils:
+        self.pencilset.get_system(self.rhs)
+        for pencil in self.pencilset.pencils:
             # Solve Tau system
             LHS = pencil.LHS
-            RHS = self.rhs[pencil]
-            X = linalg.spsolve(LHS, RHS)
+            RHS = pencil.data
+            pencil.data = linalg.spsolve(LHS, RHS)
 
-            # Update state
-            self.state[pencil] = X
+        # Update state
+        self.pencilset.set_system(self.state)
 
         self.time += dt
         self.iteration += 1
