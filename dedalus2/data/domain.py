@@ -2,81 +2,62 @@
 
 import numpy as np
 
+from .distributor import Distributor
+from .field import Field
+from .pencil import Pencil
+from ..tools.general import CachedMethod, reshape_vector
+
 
 class Domain:
-    """Domain composed of orthogonal bases."""
+    """Global domain composed of orthogonal bases."""
 
-    def __init__(self, bases, dtype=np.complex128):
+    def __init__(self, bases, grid_dtype=np.complex128):
 
-        # Properties
+        # Initial attributes
         self.bases = bases
-        self.dtype = dtype
+        self.dim = len(bases)
+        self.grid_dtype = grid_dtype
 
         # Iteratively set basis data types
-        # (Transforms from grid-space proceed in the listed order)
+        # (Transforms from grid-to-coeff proceed in the listed order)
         for b in self.bases:
-            dtype = b.set_dtype(dtype)
+            grid_dtype = b.set_dtypes(grid_dtype)
 
-        # Construct pencil slices
-        n_pencils = np.prod([b.coeff_size for b in bases])
-        n_pencils /= bases[-1].coeff_size
-        n = np.arange(int(n_pencils))
-        bi_list = []
-        d_list = []
+        # Field management
+        self._field_list = list()
+        self._field_count = 0
 
-        j = 1
-        for b in bases:
-            if b is not bases[-1]:
-                bi = divmod(n, j)[0] % b.coeff_size
-                bi_list.append(bi)
-                d_list.append(b.trans_diff([bi]))
-                j *= b.coeff_size
-            else:
-                if len(bases) == 1:
-                    bi_list.append([])
-                    d_list.append([])
-                else:
-                    bi_list = list(zip(*bi_list))
-                    d_list = list(zip(*d_list))
+        # Create distributor
+        self.distributor = Distributor(self)
 
-        self.d_list = d_list
-        self.slices = []
-        for bl in bi_list:
-            sli = []
-            for i in bl:
-                sli.append(slice(i, i+1))
-            sli.append(slice(None))
-            self.slices.append(sli)
+    @CachedMethod
+    def grid(self, axis):
 
+        if not self.distributor.grid_layout.local[axis]:
+            raise NotImplementedError("Distributed grid not implemented.")
+        #sli = self.distributor.grid_layout.slices[axis]
+        grid = self.bases[axis].grid#[sli]
+        grid = reshape_vector(grid, self.dim, axis)
 
-        # Build shape
-        self.shape = [b.grid_size for b in bases]
-        self.dim = len(self.shape)
+        return grid
 
-        # Grid
-        self.grids = [b.grid for b in bases]
-        if self.dim > 1:
-            self.grids = np.meshgrid(*self.grids, indexing='ij')
+    def _collect_field(self, field):
 
+        # Clean field
+        field.layout = self.distributor.grid_layout
+        field.data.fill(0)
 
-    #     # Pencil slices
-    #     num_pencils = np.prod(self.shape) / self.shape[-1]
-    #     self.slices = [slice(None)]
+        # Add to field list
+        self._field_list.append(field)
 
-    # def grid(self, layout):
+    def new_field(self):
 
-    #     slices = layout.slices
-    #     grids = self.grids
+        # Return a free field if available
+        if self._field_list:
+            field = self._field_list.pop()
+        # Otherwise instantiate another field
+        else:
+            field = Field(self)
 
-    #     local_grids = [g[s] for (g, s) in zip(grids, slices)]
+        return field
 
-    #     return np.meshgrid(*local_grids, indexing='ij')
-
-    def integrate(self, field):
-
-        data = field['K']
-        for b in self.bases:
-            data = b.integrate(data, 0)
-            data = b.grid_dtype(data)
-
-        return data
