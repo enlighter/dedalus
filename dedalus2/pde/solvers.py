@@ -161,8 +161,10 @@ class IVP:
         self.timestepper = timestepper(problem.nfields, domain)
 
         # Attributes
-        self.start_time = time.time()
-        self._wt_array = np.array([0.])
+        self.problem = problem
+        self.domain = domain
+        self._wall_time_array = np.zeros(1, dtype=float)
+        self.start_time = self.get_wall_time()
         self.sim_time = 0.
         self.iteration = 0
 
@@ -181,6 +183,12 @@ class IVP:
         self._sim_time = t
         self._sim_time_field['g'] = t
 
+    def get_wall_time(self):
+        self._wall_time_array[0] = time.time()
+        comm = self.domain.dist.comm_cart
+        comm.Allreduce(MPI.IN_PLACE, self._wall_time_array, op=MPI.MAX)
+        return self._wall_time_array[0]
+
     @property
     def ok(self):
         """Check that current time and iteration pass stop conditions."""
@@ -188,7 +196,7 @@ class IVP:
         if self.sim_time >= self.stop_sim_time:
             logger.info('Simulation stop time reached.')
             return False
-        elif (time.time() - self.start_time) >= self.stop_wall_time:
+        elif (self.get_wall_time() - self.start_time) >= self.stop_wall_time:
             logger.info('Wall stop time reached.')
             return False
         elif self.iteration >= self.stop_iteration:
@@ -206,13 +214,8 @@ class IVP:
         # (Safety gather)
         state.gather()
 
-        # Get latest wall time
-        comm = self.evaluator.domain.distributor.comm_cart
-        self._wt_array[0] = time.time() - self.start_time
-        comm.Allreduce(MPI.IN_PLACE, self._wt_array, op=MPI.MAX)
-        wall_time = self._wt_array[0]
-
         # Advance using timestepper
+        wall_time = self.get_wall_time() - self.start_time
         self.timestepper.step(self, dt, wall_time)
 
         # (Safety scatter)
