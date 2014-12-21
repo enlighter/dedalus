@@ -11,9 +11,12 @@ import numpy as np
 from mpi4py import MPI
 
 from .system import FieldSystem
-from .operators import Operator, Cast
+#from .operators import Operator, Cast
+from .future import Future, FutureField
+from .field import Field
 from ..tools.array import reshape_vector
 from ..tools.general import OrderedSet
+from ..tools.general import oscillate
 from ..tools.parallel import Sync
 
 
@@ -96,33 +99,33 @@ class Evaluator:
     def evaluate_handlers(self, handlers, wall_time, sim_time, iteration):
         """Evaluate a collection of handlers."""
 
-        # Attempt tasks in current layout
         tasks = [t for h in handlers for t in h.tasks]
+        for task in tasks:
+            task['out'] = None
+
+        # Attempt initial evaluation
         tasks = self.attempt_tasks(tasks, id=sim_time)
 
-        # Move all to coefficient layout
+        # Move all fields to coefficient layout
         fields = self.get_fields(tasks)
         for f in fields:
             f.require_coeff_space()
+            f.set_scales(self.domain.dealias, keep_data=True)
         tasks = self.attempt_tasks(tasks, id=sim_time)
 
         # Oscillate through layouts until all tasks are evaluated
-        L = 0
-        Lmax = self.domain.distributor.grid_layout.index
+        n_layouts = len(self.domain.dist.layouts)
+        oscillate_indices = oscillate(range(n_layouts))
+        current_index = next(oscillate_indices)
         while tasks:
-            # Change direction at first and last layouts
-            if L == 0:
-                dL = 1
-            elif L == Lmax:
-                dL = -1
+            next_index = next(oscillate_indices)
             # Transform fields
             fields = self.get_fields(tasks)
-            for f in fields:
-                if dL > 0:
-                    f.towards_grid_space()
-                else:
-                    f.towards_coeff_space()
-            L += dL
+            if current_index < next_index:
+                self.domain.dist.paths[current_index].increment(fields)
+            else:
+                self.domain.dist.paths[next_index].decrement(fields)
+            current_index = next_index
             # Attempt evaluation
             tasks = self.attempt_tasks(tasks, id=sim_time)
 
@@ -141,7 +144,7 @@ class Evaluator:
 
         fields = OrderedSet()
         for task in tasks:
-            fields.update(task['operator'].field_set())
+            fields.update(task['operator'].atoms(Field))
 
         return fields
 
@@ -197,29 +200,28 @@ class Handler:
         self.last_sim_div = -1
         self.last_iter_div = -1
 
-    def _cast_task(self, task):
-        """Cast task to operator."""
-
-        if isinstance(task, Operator):
-            return task
-        elif isinstance(task, str):
-            return Operator.from_string(task, self.vars, self.domain)
-        else:
-            return Cast(task)
-
-    def add_task(self, task, layout='g', name=None):
+    def add_task(self, task, layout='g', name=None, scales=None):
         """Add task to handler."""
 
         # Default name
         if name is None:
             name = str(task)
 
+        # Create operator
+        # if isinstance(task, Operator):
+        #     op = task
+        if isinstance(task, str):
+            op = FutureField.parse(task, self.vars, self.domain)
+        else:
+            op = FutureField.cast(task, self.domain)
+            # op = Cast(task)
+
         # Build task dictionary
-        op = self._cast_task(task)
         task = dict()
         task['operator'] = op
         task['layout'] = self.domain.distributor.get_layout_object(layout)
         task['name'] = name
+        task['scales'] = self.domain.remedy_scales(scales)
 
         self.tasks.append(task)
 
@@ -252,6 +254,7 @@ class DictionaryHandler(Handler):
         """Reference fields from dictionary."""
 
         for task in self.tasks:
+            task['out'].set_scales(task['scales'], keep_data=True)
             task['out'].require_layout(task['layout'])
             self.fields[task['name']] = task['out']
 
@@ -263,7 +266,8 @@ class SystemHandler(Handler):
         """Build FieldSystem and set task outputs."""
 
         nfields = len(self.tasks)
-        self.system = FieldSystem(range(nfields), self.domain)
+        names = ['sys'+str(i) for i in range(nfields)]
+        self.system = FieldSystem(names, self.domain)
 
         for i, task in enumerate(self.tasks):
             task['operator'].out = self.system.fields[i]
@@ -402,20 +406,17 @@ class FileHandler(Handler):
         scale_group.create_dataset(name='write_number', shape=(0,), maxshape=(None,), dtype=np.int)
         const = scale_group.create_dataset(name='constant', data=np.array([0.], dtype=np.float64))
         for axis, basis in enumerate(domain.bases):
-            grid = basis.grid
-            elem = basis.elements
-            gdset = scale_group.create_dataset(name=basis.name, shape=grid.shape, dtype=grid.dtype)
-            edset = scale_group.create_dataset(name=basis.element_label+basis.name, shape=elem.shape, dtype=elem.dtype)
-            if (not self.parallel) or (domain.distributor.rank == 0):
-                gdset[:] = grid
-                edset[:] = elem
+            coeff_name = basis.element_label + basis.name
+            scale_group.create_dataset(name=coeff_name, data=basis.elements)
+            scale_group.create_group(basis.name)
 
         # Tasks
         task_group =  file.create_group('tasks')
         for task_num, task in enumerate(self.tasks):
             layout = task['layout']
-            constant = task['operator'].constant
-            gnc_shape, gnc_start, write_shape, write_start, write_count = self.get_write_stats(layout, constant, index=0)
+            constant = task['operator'].meta[:]['constant']
+            scales = task['scales']
+            gnc_shape, gnc_start, write_shape, write_start, write_count = self.get_write_stats(layout, scales, constant, index=0)
             if np.prod(write_shape) <= 1:
                 # Start with shape[0] = 0 to chunk across writes for scalars
                 file_shape = (0,) + tuple(write_shape)
@@ -433,6 +434,7 @@ class FileHandler(Handler):
             dset.attrs['task_number'] = task_num
             dset.attrs['constant'] = constant
             dset.attrs['grid_space'] = layout.grid_space
+            dset.attrs['scales'] = scales
 
             # Time scales
             dset.dims[0].label = 't'
@@ -444,14 +446,18 @@ class FileHandler(Handler):
             # Spatial scales
             for axis, basis in enumerate(domain.bases):
                 if constant[axis]:
-                    sn = 'constant'
+                    sn = lookup = 'constant'
                 else:
                     if layout.grid_space[axis]:
                         sn = basis.name
+                        axscale = scales[axis]
+                        if str(axscale) not in scale_group[sn]:
+                            scale_group[sn].create_dataset(name=str(axscale), data=basis.grid(axscale))
+                        lookup = '/'.join((sn, str(axscale)))
                     else:
-                        sn = basis.element_label + basis.name
-                scale = scale_group[sn]
-                dset.dims.create_scale(scale, sn)
+                        sn = lookup = basis.element_label + basis.name
+                scale = scale_group[lookup]
+                dset.dims.create_scale(scale, lookup)
                 dset.dims[axis+1].label = sn
                 dset.dims[axis+1].attach_scale(scale)
 
@@ -482,12 +488,13 @@ class FileHandler(Handler):
         # Create task datasets
         for task_num, task in enumerate(self.tasks):
             out = task['out']
+            out.set_scales(task['scales'], keep_data=True)
             out.require_layout(task['layout'])
 
             dset = file['tasks'][task['name']]
             dset.resize(index+1, axis=0)
 
-            memory_space, file_space = self.get_hdf5_spaces(out.layout, out.constant, index)
+            memory_space, file_space = self.get_hdf5_spaces(out.layout, task['scales'], out.meta[:]['constant'], index)
             if self.parallel:
                 dset.id.write(memory_space, file_space, out.data, dxpl=self._property_list)
             else:
@@ -495,13 +502,14 @@ class FileHandler(Handler):
 
         file.close()
 
-    def get_write_stats(self, layout, constant, index):
+    def get_write_stats(self, layout, scales, constant, index):
         """Determine write parameters for nonconstant subspace of a field."""
 
+        constant = np.array(constant)
         # References
-        gshape = layout.global_shape
-        lshape = layout.shape
-        start = layout.start
+        gshape = layout.global_shape(scales)
+        lshape = layout.local_shape(scales)
+        start = layout.start(scales)
         first = (start == 0)
 
         # Build counts, taking just the first entry along constant axes
@@ -526,13 +534,14 @@ class FileHandler(Handler):
 
         return global_nc_shape, global_nc_start, write_shape, write_start, write_count
 
-    def get_hdf5_spaces(self, layout, constant, index):
+    def get_hdf5_spaces(self, layout, scales, constant, index):
         """Create HDF5 space objects for writing nonconstant subspace of a field."""
 
+        constant = np.array(constant)
         # References
-        lshape = layout.shape
-        start = layout.start
-        gnc_shape, gnc_start, write_shape, write_start, write_count = self.get_write_stats(layout, constant, index)
+        lshape = layout.local_shape(scales)
+        start = layout.start(scales)
+        gnc_shape, gnc_start, write_shape, write_start, write_count = self.get_write_stats(layout, scales, constant, index)
 
         # Build HDF5 spaces
         memory_shape = tuple(lshape)

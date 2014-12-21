@@ -28,25 +28,15 @@ def build_pencils(domain):
     """
 
     # Get transverse indeces in fastest sequence
-    index_list = []
-    if domain.dim == 1:
-        index_list.append([])
-    else:
-        trans_shape = domain.distributor.coeff_layout.shape[:-1]
-        div = np.arange(np.prod(trans_shape))
-        for s in reversed(trans_shape):
-            div, mod = divmod(div, s)
-            index_list.append(mod)
-        index_list = list(zip(*reversed(index_list)))
+    trans_shape = domain.local_coeff_shape[:-1]
+    indices = np.ndindex(*trans_shape)
 
     # Construct corresponding trans diff consts and build pencils
     pencils = []
-    start = domain.distributor.coeff_layout.start
-    for index in index_list:
-        trans = []
-        for i, b in enumerate(domain.bases[:-1]):
-            trans.append(b.trans_diff(start[i]+index[i]))
-        pencils.append(Pencil(index, trans))
+    scales = domain.remedy_scales(1)
+    start = domain.distributor.coeff_layout.start(scales)[:-1]
+    for index in indices:
+        pencils.append(Pencil(domain, index, start+index))
 
     return pencils
 
@@ -59,114 +49,180 @@ class Pencil:
     ----------
     index : tuple of ints
         Transverse indeces for retrieving pencil from system data
-    trans :  tuple of floats
-        Transverse differentiation constants
 
     """
 
-    def __init__(self, index, trans):
+    def __init__(self, domain, local_index, global_index):
+        self.domain = domain
+        self.local_index = tuple(local_index)
+        self.global_index = tuple(global_index)
+        if domain.bases[-1].coupled:
+            self.build_matrices = self._build_coupled_matrices
+        else:
+            self.build_matrices = self._build_uncoupled_matrices
 
-        # Initial attributes
-        # Save index as tuple for proper array indexing behavior
-        self.index = tuple(index)
-        self.trans = trans
+    def _build_uncoupled_matrices(self, problem, names):
+        raise NotImplementedError()
 
-    def build_matrices(self, problem, basis):
-        """Construct pencil matrices from problem and basis matrices."""
+    def _build_coupled_matrices(self, problem, names):
 
-        # References
-        size = problem.nfields * basis.coeff_size
-        dtype = basis.coeff_dtype
+        index_dict = {}
+        for axis, basis in enumerate(self.domain.bases):
+            if basis.separable:
+                index_dict['n'+basis.name] = self.global_index[axis]
 
-        # Get and unpack problem matrices
-        eqn_mat, bc_mat, S_mat = problem.build_matrices(self.trans)
-        M0e, M1e, L0e, L1e = eqn_mat
-        M0b, M1b, L0b, L1b = bc_mat
-        Se, Sl, Sr, Si = S_mat
+        index = self.global_index
+        # Find applicable equations
+        selected_eqs = [eq for eq in problem.eqs if eval(eq['raw_condition'], index_dict)]
+        selected_bcs = [bc for bc in problem.bcs if eval(bc['raw_condition'], index_dict)]
+        ndiff = sum(eq['differential'] for eq in selected_eqs)
+        # Check selections
+        nvars = problem.nvars
+        neqs = len(selected_eqs)
+        nbcs = len(selected_bcs)
+        if neqs != nvars:
+            raise ValueError("Pencil {} has {} equations for {} variables.".format(index, neqs, nvars))
+        if nbcs != ndiff:
+            raise ValueError("Pencil {} has {} boudnary conditions for {} differential equations.".format(index, nbcs, ndiff))
+        Neqs = len(problem.eqs)
+        Nbcs = len(problem.bcs)
+
+        zbasis = self.domain.bases[-1]
+        zsize = zbasis.coeff_size
+        zdtype = zbasis.coeff_dtype
+        compound = hasattr(zbasis, 'subbases')
+
+        # Copy problem namespace
+        namespace = problem.coefficient_namespace.copy()
+        # Separable basis operators
+        for axis, basis in enumerate(problem.domain.bases):
+            if basis.separable:
+                for op in basis.operators:
+                    try:
+                        namespace.update(op.scalar_form(index[axis]))
+                    except AttributeError:
+                        pass
+        # Identity
+        namespace['Identity'] = sparse.identity(zsize, dtype=zdtype).tocsr()
+        namespace['Zero'] = sparse.csr_matrix((zsize, zsize), dtype=zdtype)
+
+        # Basis matrices
+        R = namespace['Identity'] #basis.Rearrange
+        if ndiff:
+            P = basis.Precondition
+            Fb = basis.FilterBoundaryRow
+            Cb = basis.ConstantToBoundary
+            R_Fb_P = R*Fb*P
+            R_Cb = R*Cb
+        if compound:
+            Fm = basis.FilterMatchRows
+            M = basis.Match
+            R_Fm = R*Fm
+        if ndiff and compound:
+            R_Fm_Fb_P = R_Fm*Fb*P
+
+        # Pencil matrices
+        G_eq = sparse.csr_matrix((zsize*nvars, zsize*Neqs), dtype=zdtype)
+        G_bc = sparse.csr_matrix((zsize*nvars, zsize*Nbcs), dtype=zdtype)
+        C = lambda : sparse.csr_matrix((zsize*nvars, zsize*nvars), dtype=zdtype)
+        LHS = {name: C() for name in names}
+
+        # Kronecker stencils
+        δG_eq = np.zeros([nvars, Neqs])
+        δG_bc = np.zeros([nvars, Nbcs])
+        δC = np.zeros([nvars, nvars])
 
         # Use scipy sparse kronecker product with CSR output
         kron = partial(sparse.kron, format='csr')
 
-        # Allocate PDE matrices
-        Me = sparse.csr_matrix((size, size), dtype=dtype)
-        Le = sparse.csr_matrix((size, size), dtype=dtype)
+        # Build matrices
+        bc_iter = iter(selected_bcs)
+        for i, eq in enumerate(selected_eqs):
 
-        # Add terms to PDE matrices
-        nsubs = len(basis.subbases)
-        for isub in range(nsubs):
-            for p in range(problem.order):
-                PM  = basis.Pre * basis.Mult(p, isub)
-                PMD = basis.Pre * basis.Mult(p, isub) * basis.Diff
-                Me = Me + kron(PM,  Se*M0e[isub][p])
-                Me = Me + kron(PMD, Se*M1e[isub][p])
-                Le = Le + kron(PM,  Se*L0e[isub][p])
-                Le = Le + kron(PMD, Se*L1e[isub][p])
+            differential = eq['differential']
+            if differential:
+                bc = next(bc_iter)
 
-        # Allocate BC matrices
-        Mb = sparse.csr_matrix((size, size), dtype=dtype)
-        Lb = sparse.csr_matrix((size, size), dtype=dtype)
+            # Build RHS equation process matrix
+            if (not differential) and (not compound):
+                Gi_eq = R
+            elif (not differential) and compound:
+                Gi_eq = R_Fm
+            elif differential and (not compound):
+                Gi_eq = R_Fb_P
+            elif differential and compound:
+                Gi_eq = R_Fm_Fb_P
 
-        # Add terms to BC matrices
-        if Sl.any():
-            for isub in range(nsubs):
-                for p in range(problem.order):
-                    LM  = basis.Left * basis.Mult(p, isub)
-                    LMD = basis.Left * basis.Mult(p, isub) * basis.Diff
-                    Mb = Mb + kron(LM,  Sl*M0b[isub][p])
-                    Mb = Mb + kron(LMD, Sl*M1b[isub][p])
-                    Lb = Lb + kron(LM,  Sl*L0b[isub][p])
-                    Lb = Lb + kron(LMD, Sl*L1b[isub][p])
-        if Sr.any():
-            for isub in range(nsubs):
-                for p in range(problem.order):
-                    RM  = basis.Right * basis.Mult(p, isub)
-                    RMD = basis.Right * basis.Mult(p, isub) * basis.Diff
-                    Mb = Mb + kron(RM,  Sr*M0b[isub][p])
-                    Mb = Mb + kron(RMD, Sr*M1b[isub][p])
-                    Lb = Lb + kron(RM,  Sr*L0b[isub][p])
-                    Lb = Lb + kron(RMD, Sr*L1b[isub][p])
-        if Si.any():
-            for isub in range(nsubs):
-                for p in range(problem.order):
-                    IM  = basis.Int * basis.Mult(p, isub)
-                    IMD = basis.Int * basis.Mult(p, isub) * basis.Diff
-                    Mb = Mb + kron(IM,  Si*M0b[isub][p])
-                    Mb = Mb + kron(IMD, Si*M1b[isub][p])
-                    Lb = Lb + kron(IM,  Si*L0b[isub][p])
-                    Lb = Lb + kron(IMD, Si*L1b[isub][p])
+            # Kronecker into system matrix
+            e = problem.eqs.index(eq)
+            δG_eq[i,e] = 1
+            G_eq = G_eq + kron(Gi_eq, δG_eq)
+            δG_eq[i,e] = 0
 
-        # Build match matrices for combined basis
-        I = sparse.identity(problem.nfields, dtype=dtype, format='csr')
-        try:
-            Lm = kron(basis.Match, I)
-        except AttributeError:
-            Lm = sparse.csr_matrix((size, size), dtype=dtype)
+            if differential:
+                # Build RHS BC process matrix
+                Gi_bc = R_Cb
+                # Kronecker into system matrix
+                b = problem.bcs.index(bc)
+                δG_bc[i,b] = 1
+                G_bc = G_bc + kron(Gi_bc, δG_bc)
+                δG_bc[i,b] = 0
 
-        # Build filter matrix to eliminate boundary condition rows
-        Mb_rows = Mb.nonzero()[0]
-        Lb_rows = Lb.nonzero()[0]
-        Lm_rows = Lm.nonzero()[0]
-        rows = set().union(Mb_rows, Lb_rows, Lm_rows)
-        F = sparse.identity(size, dtype=dtype, format='dok')
-        for i in rows:
-            F[i, i] = 0
-        F = F.tocsr()
+            # Build LHS matrices
+            for name in LHS:
+                C = LHS[name]
+                for j in range(nvars):
+                    # Build equation terms
+                    Eij = eval(eq[name][j], namespace)
+                    if Eij is 0:
+                        Eij = None
+                    elif Eij is 1:
+                        Eij = Gi_eq
+                    else:
+                        Eij = Gi_eq*Eij
+                    # Build BC terms
+                    if differential:
+                        Bij = eval(bc[name][j], namespace)
+                        if Bij is 0:
+                            Bij = None
+                        elif Bij is 1:
+                            Bij = Gi_bc
+                        else:
+                            Bij = Gi_bc*Bij
+                    else:
+                        Bij = None
+                    # Combine equation and BC
+                    if (Eij is None) and (Bij is None):
+                        continue
+                    elif Eij is None:
+                        Cij = Bij
+                    elif Bij is None:
+                        Cij = Eij
+                    else:
+                        Cij = Eij + Bij
+                    # Kronecker into system
+                    δC[i,j] = 1
+                    C = C + kron(Cij, δC)
+                    δC[i,j] = 0
+                LHS[name] = C
 
-        # Combine filtered PDE matrices with BC matrices
-        M = F*Me + Mb
-        L = F*Le + Lb + Lm
+        if compound:
+            # Add match terms
+            L = LHS['L']
+            δM = np.identity(nvars)
+            L = L + kron(R*M, δM)
+            LHS['L'] = L
 
         # Store with expanded sparsity for fast combination during timestepping
-        self.LHS = zeros_with_pattern(M, L).tocsr()
-        self.M = expand_pattern(M, self.LHS).tocsr()
-        self.L = expand_pattern(L, self.LHS).tocsr()
+        for C in LHS.values():
+            C.eliminate_zeros()
+        self.LHS = zeros_with_pattern(*LHS.values()).tocsr()
+        for name, C in LHS.items():
+            C = expand_pattern(C, self.LHS).tocsr()
+            setattr(self, name, C)
 
-        # Store selection/restriction matrices for RHS
-        # Start G_bc with integral term, since the Int matrix is always defined
-        self.G_eq = F * kron(basis.Pre, Se)
-        self.G_bc = kron(basis.Int, Si)
-        if Sl.any():
-            self.G_bc = self.G_bc + kron(basis.Left, Sl)
-        if Sr.any():
-            self.G_bc = self.G_bc + kron(basis.Right, Sr)
-
+        # Store operators for RHS
+        G_eq.eliminate_zeros()
+        self.G_eq = G_eq
+        G_bc.eliminate_zeros()
+        self.G_bc = G_bc

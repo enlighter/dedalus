@@ -3,15 +3,16 @@ Class for problem domain.
 
 """
 
+import logging
 import numpy as np
 
+from .metadata import Metadata
 from .distributor import Distributor
-from .field import Field
-from .operators import create_diff_operator
+from .field import Scalar, Field
+#from .operators import create_diff_operator
 from ..tools.cache import CachedMethod
 from ..tools.array import reshape_vector
 
-import logging
 logger = logging.getLogger(__name__.split('.')[-1])
 
 
@@ -39,119 +40,136 @@ class Domain:
 
     def __init__(self, bases, grid_dtype=np.complex128, mesh=None):
 
-        # Initial attributes
-        self.bases = bases
-        self.dim = len(bases)
-        self.grid_dtype = grid_dtype
-        self.hypervolume = np.prod([(basis.interval[1]-basis.interval[0]) for basis in bases])
-
         # Iteratively set basis data types
         # (Grid-to-coefficient transforms proceed in the listed order)
-        for b in bases:
-            grid_dtype = b.set_transforms(grid_dtype)
+        for basis in bases:
+            grid_dtype = basis.set_dtype(grid_dtype)
 
-        # Get global grid and coefficient shapes
-        self.global_grid_shape = np.array([b.grid_size for b in bases], dtype=int)
+        self.bases = bases
+        self.dim = len(bases)
+        self.dealias = tuple(basis.dealias for basis in bases)
+		self.hypervolume = np.prod([(basis.interval[1]-basis.interval[0]) for basis in bases])
         self.global_coeff_shape = np.array([b.coeff_size for b in bases], dtype=int)
-        logger.debug('Global grid shape: %s' %str(self.global_grid_shape))
         logger.debug('Global coeff shape: %s' %str(self.global_coeff_shape))
 
-        # Manage field allocation
-        self._field_cache = list()
-        self._field_count = 0
-
         # Create distributor
-        self.distributor = Distributor(self, mesh)
-        self.dist = self.distributor
-        self.local_grid_shape = self.distributor.grid_layout.shape
-        self.local_coeff_shape = self.distributor.coeff_layout.shape
+        self.distributor = self.dist = Distributor(self, mesh)
+        self.local_coeff_shape = self.dist.coeff_layout.local_shape(self.remedy_scales(None))
 
         # Create differential operators
-        self.diff_ops = [create_diff_operator(b,i) for (i,b) in enumerate(self.bases)]
+        #self.diff_ops = [create_diff_operator(b,i) for (i,b) in enumerate(self.bases)]
+
+    def global_grid_shape(self, scales=None):
+
+        scales = self.remedy_scales(scales)
+        return np.array([b.grid_size(s) for (s, b) in zip(scales, self.bases)])
+
+    def local_grid_shape(self, scales=None):
+
+        scales = self.remedy_scales(scales)
+        return self.dist.grid_layout.local_shape(scales)
 
     def get_basis_object(self, basis_like):
         """Return basis from a related object."""
 
+        # Objects
         if basis_like in self.bases:
             return basis_like
-        if basis_like in self.diff_ops:
-            axis = self.diff_ops.index(basis_like)
-            return self.bases[axis]
-        if isinstance(basis_like, str):
-            for b in self.bases:
-                if basis_like == b.name:
-                    return b
-            raise ValueError("No matching basis name.")
-        else:
+        # Indices
+        elif isinstance(basis_like, int):
             return self.bases[basis_like]
+        # Names
+        if isinstance(basis_like, str):
+            for basis in self.bases:
+                if basis_like == basis.name:
+                    return basis
+        # Otherwise
+        else:
+            return None
+
+    def grids(self, scales=None):
+        """Return list of local grids along each axis."""
+
+        return [self.grid(i, scales) for i in range(self.dim)]
 
     @CachedMethod
-    def grid(self, axis):
-        """Return local grid along specified axis."""
+    def grid(self, axis, scales=None):
+        """Return local grid along one axis."""
 
-        # Get local part of basis grid
-        start = self.distributor.grid_layout.start[axis]
-        size = self.distributor.grid_layout.shape[axis]
-        grid = self.bases[axis].grid[start:start+size]
-
+        scales = self.remedy_scales(scales)
+        # Get local part of global basis grid
+        slices = self.distributor.grid_layout.slices(scales)
+        grid = self.bases[axis].grid(scales[axis])
+        grid = grid[slices[axis]]
         # Reshape as multidimensional vector
         grid = reshape_vector(grid, self.dim, axis)
 
         return grid
 
-    def grids(self):
-        """Return list of local grids along each axis."""
-
-        return [self.grid(i) for i in range(self.dim)]
-
     @CachedMethod
-    def grid_spacing(self, axis):
-        """Return minimum grid spacing along specified axis."""
+    def grid_spacing(self, axis, scales=None):
+        """Compute grid spacings along one axis."""
 
-        # Compute spacing on basis grid to include non-local spaces
-        grid = self.bases[axis].grid
-        diff = np.abs(np.diff(grid))
-        spacing = np.zeros_like(grid)
-        spacing[0] = diff[0]
-        for i in range(1, grid.size-1):
-            spacing[i] = min_nonzero(diff[i], diff[i-1])
-        spacing[-1] = diff[-1]
-
-        # Get local part of basis spacing
-        start = self.distributor.grid_layout.start[axis]
-        size = self.distributor.grid_layout.shape[axis]
-        spacing = spacing[start:start+size]
-
+        scales = self.remedy_scales(scales)
+        # Compute spacing on global basis grid
+        # This includes inter-process spacings
+        grid = self.bases[axis].grid(scales[axis])
+        spacing = np.gradient(grid)
+        # Restrict to local part of global spacing
+        slices = self.dist.grid_layout.slices(scales)
+        spacing = spacing[slices[axis]]
         # Reshape as multidimensional vector
         spacing = reshape_vector(spacing, self.dim, axis)
 
         return spacing
 
-    def _collect_field(self, field):
-        """Cache free field."""
+    def new_data(self, type, **kw):
+        return type(self, **kw)
 
-        # Add cleaned field to cache
-        field.clean()
-        self._field_cache.append(field)
+    def new_field(self, **kw):
+        return Field(self, **kw)
 
-    def new_field(self, name=None, constant=None):
-        """Return a free field."""
+    def remedy_scales(self, scales):
 
-        # Return a previously allocated field, if available
-        if self._field_cache:
-            field = self._field_cache.pop()
-        # Otherwise instantiate a new field
+        # Default to 1.
+        if scales is None:
+            return tuple([1.] * self.dim)
+        # Repeat scalars
+        elif np.isscalar(scales):
+            return tuple([scales] * self.dim)
+        # Cast others as tuple
         else:
-            field = Field(self)
-
-        # Set attributes
-        field.name = name
-        field.constant[:] = constant
-
-        return field
+            return tuple(scales)
 
 
-def min_nonzero(*args):
-    nonzero = lambda x: x != 0
-    return min(filter(nonzero, args))
+class EmptyDomain:
 
+    def __init__(self, grid_dtype=np.complex128):
+
+        self.bases = []
+        self.dim = 0
+
+    def get_basis_object(self, basis_like):
+        """Return basis from a related object."""
+
+        return None
+
+    def new_data(self, type, **kw):
+        if type != Scalar:
+            raise ValueError()
+        return type(self, **kw)
+
+
+def combine_domains(*domains):
+    # Drop Nones
+    domains = [domain for domain in domains if domain]
+    # Drop Emptys
+    domains = [domain for domain in domains if not isinstance(domain, EmptyDomain)]
+    # Get set
+    domain_set = set(domains)
+    if len(domain_set) == 0:
+        return EmptyDomain()
+    if len(domain_set) > 1:
+        raise ValueError("Non-unique domains")
+    else:
+        return list(domain_set)[0]
