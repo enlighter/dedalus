@@ -3,21 +3,255 @@ Class for data fields.
 
 """
 
+import weakref
 from functools import partial
 import numpy as np
+from mpi4py import MPI
+import sympy as sy
 from scipy import sparse
 from scipy.sparse import linalg as splinalg
 import weakref
 
-from .future import Future
+from .metadata import Metadata
+from ..libraries.fftw import fftw_wrappers as fftw
 from ..tools.config import config
+from ..tools.array import reshape_vector
+from ..tools.exceptions import UndefinedParityError
 
 # Load config options
 permc_spec = config['linear algebra']['permc_spec']
 use_umfpack = config['linear algebra'].getboolean('use_umfpack')
 
 
-class Field(Future):
+class Operand:
+
+    def __getattr__(self, attr):
+        # Intercept numpy ufunc calls
+        from .operators import UnaryGridFunction
+        try:
+            ufunc = UnaryGridFunction.supported[attr]
+            return partial(UnaryGridFunction, ufunc, self)
+        except KeyError:
+            raise AttributeError("%r object has no attribute %r" %(self.__class__.__name__, attr))
+
+    ## Idea for alternate ufunc implementation based on changes coming in numpy 1.10
+    # def __numpy_ufunc__(self, ufunc, method, i, inputs, **kw):
+    #     from .operators import UnaryGridFunction
+    #     if ufunc in UnaryGridFunction.supported:
+    #         return UnaryGridFunction(ufunc, self, **kw)
+    #     else:
+    #         return NotImplemented
+
+    def __abs__(self):
+        # Call: abs(self)
+        from .operators import UnaryGridFunction
+        return UnaryGridFunction(np.absolute, self)
+
+    def __neg__(self):
+        # Call: -self
+        return ((-1) * self)
+
+    def __add__(self, other):
+        # Call: self + other
+        from .operators import Add
+        return Add(self, other)
+
+    def __radd__(self, other):
+        # Call: other + self
+        from .operators import Add
+        return Add(other, self)
+
+    def __sub__(self, other):
+        # Call: self - other
+        return (self + (-other))
+
+    def __rsub__(self, other):
+        # Call: other - self
+        return (other + (-self))
+
+    def __mul__(self, other):
+        # Call: self * other
+        from .operators import Multiply
+        return Multiply(self, other)
+
+    def __rmul__(self, other):
+        # Call: other * self
+        from .operators import Multiply
+        return Multiply(other, self)
+
+    def __truediv__(self, other):
+        # Call: self / other
+        return (self * other**(-1))
+
+    def __rtruediv__(self, other):
+        # Call: other / self
+        return (other * self**(-1))
+
+    def __pow__(self, other):
+        # Call: self ** other
+        from .operators import Power
+        return Power(self, other)
+
+    def __rpow__(self, other):
+        # Call: other ** self
+        from .operators import Power
+        return Power(other, self)
+
+    @staticmethod
+    def cast(x, domain=None):
+        x = Operand.raw_cast(x)
+        if domain:
+            # Replace empty domains
+            if x.domain.dim == 0:
+                x.domain = domain
+            elif x.domain != domain:
+                    raise ValueError("Cannot cast operand to different domain.")
+        return x
+
+    @staticmethod
+    def raw_cast(x):
+        if isinstance(x, Operand):
+            return x
+        elif np.isscalar(x):
+            return Scalar(value=x)
+        else:
+            raise ValueError("Cannot cast type: {}".format(type(x)))
+
+    def as_symbolic_operator(self, vars):
+        if self in vars:
+            return self.as_symbol()
+        else:
+            return self.as_ncc_symbol()
+
+    def as_ncc_symbol(self):
+        # Require constant along separable axes
+        for basis in self.domain.bases:
+            if basis.separable:
+                if not self.meta[basis.name]['constant']:
+                    raise ValueError("{} is non-constant along separable direction '{}'.".format(self, basis.name))
+        return self.as_symbol()
+
+
+class Data(Operand):
+
+    __array_priority__ = 100.
+
+    def __repr__(self):
+        return '<{} {}>'.format(self.__class__.__name__, id(self))
+
+    def __str__(self):
+        if self.name:
+            return self.name
+        else:
+            return self.__repr__()
+
+    def atoms(self, *types, **kw):
+        if isinstance(self, types) or (not types):
+            return (self,)
+        else:
+            return ()
+
+    def has(self, *atoms):
+        return (self in atoms)
+
+    def distribute_over(self, atoms):
+        return self
+
+
+class Scalar(Data):
+
+    class ScalarMeta:
+        """Shortcut class to return scalar metadata for any axis."""
+        def __init__(self, scalar=None):
+            self.scalar = scalar
+
+        def __getitem__(self, axis):
+            if self.scalar and (self.scalar.value == 0):
+                parity = 0
+            else:
+                parity = 1
+            return {'constant': True, 'parity': parity}
+
+
+    def __init__(self, value=None, name=None, domain=None):
+        from .domain import EmptyDomain
+        self.name = name
+        self.meta = self.ScalarMeta(self)
+        self.domain = EmptyDomain()
+        self.value = value
+
+    def __str__(self):
+        if self.name:
+            return self.name
+        else:
+            return repr(self.value)
+
+    def as_symbol(self):
+        if self.name:
+            return sy.Symbol(str(self), commutative=True)
+        else:
+            return self.value
+
+
+class Array(Data):
+
+    def __init__(self, domain, name=None):
+        self.domain = domain
+        self.name = name
+        self.meta = Metadata(domain)
+
+        layout = domain.dist.grid_layout
+        scales = domain.dealias
+
+        self.data = np.zeros(shape=layout.local_shape(scales),
+                             dtype=layout.dtype)
+
+        for i in range(domain.dim):
+            self.meta[i]['scale'] = scales[i]
+
+    def set_scales(self, scales, *, keep_data):
+        """Set new transform scales."""
+
+        pass
+
+    def from_global_vector(self, data, axis):
+        # Set metadata
+        for i in range(self.domain.dim):
+            axmeta = self.meta[i]
+            if i == axis:
+                axmeta['constant'] = False
+            else:
+                axmeta['constant'] = True
+            if 'parity' in axmeta:
+                axmeta['parity'] = 1
+        # Save local slice
+        scales = self.meta[:]['scale']
+        local_slice =  self.domain.dist.grid_layout.slices(scales)[axis]
+        local_data = data[local_slice]
+        local_data = reshape_vector(data[local_slice], dim=self.domain.dim, axis=axis)
+        np.copyto(self.data, local_data)
+
+    def from_local_vector(self, data, axis):
+        # Set metadata
+        for i in range(self.domain.dim):
+            axmeta = self.meta[i]
+            if i == axis:
+                axmeta['constant'] = False
+            else:
+                axmeta['constant'] = True
+            if 'parity' in axmeta:
+                axmeta['parity'] = 1
+        # Save data
+        np.copyto(self.data, data)
+
+    def as_symbol(self):
+        if self.name:
+            return sy.Symbol(str(self), commutative=False)
+        else:
+            raise ValueError("Can't represent unnamed Array symbolically.")
+
+
+class Field(Data):
     """
     Scalar field over a domain.
 
@@ -37,35 +271,25 @@ class Field(Future):
 
     """
 
-    def __init__(self, domain, name=None, constant=None):
+    # To Do: cache deallocation
+
+    def __init__(self, domain, name=None, allocate=True):
 
         # Initial attributes
+        self.domain = domain
         self.name = name
 
-        # Weak-reference domain to allow cyclic garbage collection
-        self._domain_weak_ref = weakref.ref(domain)
+        # Metadata
+        self.meta = Metadata(domain)
 
-        # Increment domain field count
-        domain._field_count += 1
+        # Set layout and scales to build buffer and data
+        self._layout = domain.dist.coeff_layout
+        if allocate:
+            self.set_scales(1, keep_data=False)
+        self.name = name
 
-        # Allocate data buffer
-        self._buffer = domain.distributor.create_buffer()
-
-        # Set initial layout (property hook sets data view)
-        self.layout = self.domain.distributor.coeff_layout
-
-        # Default to non-constant
-        if constant is None:
-            constant = np.array([False] * domain.dim)
-        self.constant = constant
-
-    def clean(self):
-        """Revert field to state at instantiation."""
-
-        self.layout = self.domain.distributor.coeff_layout
-        self.constant[:] = False
-        self.data.fill(0.)
-        self.name = None
+    def as_symbol(self):
+        return sy.Symbol(str(self), commutative=False)
 
     @property
     def layout(self):
@@ -74,41 +298,66 @@ class Field(Future):
     @layout.setter
     def layout(self, layout):
         self._layout = layout
-        self.data = layout.view_data(self._buffer)
-
-    @property
-    def domain(self):
-        return self._domain_weak_ref()
-
-    def __del__(self):
-        """Intercept deallocation to cache unused fields in domain."""
-
-        # Check that domain is still instantiated
-        if self.domain:
-            self.domain._collect_field(self)
-
-    def __repr__(self):
-        return '<Field %i>' %id(self)
-
-    def __str__(self):
-        if self.name:
-            return self.name
-        else:
-            return self.__repr__()
+        # Update data view
+        scales = self.meta[:]['scale']
+        self.data = np.ndarray(shape=layout.local_shape(scales),
+                               dtype=layout.dtype,
+                               buffer=self.buffer)
 
     def __getitem__(self, layout):
         """Return data viewed in specified layout."""
 
         self.require_layout(layout)
-
         return self.data
 
     def __setitem__(self, layout, data):
         """Set data viewed in a specified layout."""
 
-        layout = self.domain.distributor.get_layout_object(layout)
-        self.layout = layout
+        self.layout = self.domain.distributor.get_layout_object(layout)
         np.copyto(self.data, data)
+
+    @staticmethod
+    def _create_buffer(buffer_size):
+        """Create buffer for Field data."""
+
+        if buffer_size == 0:
+            # FFTW doesn't like allocating size-0 arrays
+            return np.zeros((0,), dtype=np.float64)
+        else:
+            # Use FFTW SIMD aligned allocation
+            alloc_doubles = buffer_size // 8
+            return fftw.create_buffer(alloc_doubles)
+
+    def set_scales(self, scales, *, keep_data):
+        """Set new transform scales."""
+
+        new_scales = self.domain.remedy_scales(scales)
+        old_scales = self.meta[:]['scale']
+        if new_scales == old_scales:
+            return
+
+        if keep_data:
+            # Forward transform until remaining scales match
+            for axis in reversed(range(self.domain.dim)):
+                if not self.layout.grid_space[axis]:
+                    break
+                if old_scales[axis] != new_scales[axis]:
+                    self.require_coeff_space(axis)
+                    break
+            # Reference data
+            old_data = self.data
+
+        # Set metadata
+        for axis, scale in enumerate(new_scales):
+            self.meta[axis]['scale'] = scale
+        # Build new buffer
+        buffer_size = self.domain.distributor.buffer_size(new_scales)
+        self.buffer = self._create_buffer(buffer_size)
+        # Reset layout to build new data view
+        self.layout = self.layout
+
+        if keep_data:
+            np.copyto(self.data, old_data)
 
     def require_layout(self, layout):
         """Change to specified layout."""
@@ -118,20 +367,22 @@ class Field(Future):
         # Transform to specified layout
         if self.layout.index < layout.index:
             while self.layout.index < layout.index:
+                #self.domain.distributor.increment_layout(self)
                 self.towards_grid_space()
         elif self.layout.index > layout.index:
             while self.layout.index > layout.index:
+                #self.domain.distributor.decrement_layout(self)
                 self.towards_coeff_space()
 
     def towards_grid_space(self):
         """Change to next layout towards grid space."""
-
-        self.domain.distributor.increment_layout(self)
+        index = self.layout.index
+        self.domain.dist.paths[index].increment(self)
 
     def towards_coeff_space(self):
         """Change to next layout towards coefficient space."""
-
-        self.domain.distributor.decrement_layout(self)
+        index = self.layout.index
+        self.domain.dist.paths[index-1].decrement(self)
 
     def require_grid_space(self, axis=None):
         """Require one axis (default: all axes) to be in grid space."""
@@ -170,7 +421,7 @@ class Field(Future):
         # Use differentiation operator
         basis = self.domain.get_basis_object(basis)
         axis = self.domain.bases.index(basis)
-        diff_op = self.domain.diff_ops[axis]
+        diff_op = basis.Differentiate
         return diff_op(self, out=out).evaluate()
 
     def integrate(self, *bases, out=None):
@@ -245,3 +496,17 @@ class Field(Future):
             out_c[p] = splinalg.spsolve(LHS, rhs, use_umfpack=use_umfpack, permc_spec=permc_spec)
 
         return out
+
+    @staticmethod
+    def cast(input, domain):
+        from .operators import FieldCopy
+        from .future import FutureField
+        # Cast to operand and check domain
+        input = Operand.cast(input, domain=domain)
+        if isinstance(input, (Field, FutureField)):
+            return input
+        else:
+            # Cast to FutureField
+            return FieldCopy(input, domain)
+
+

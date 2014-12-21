@@ -3,6 +3,8 @@ Tools for emulating multiple dispatch.
 
 """
 
+from .cache import CachedClass
+
 
 class MultiClass(type):
     """Metaclass for dispatching instantiation to subclasses."""
@@ -10,23 +12,45 @@ class MultiClass(type):
     def __call__(cls, *args, **kw):
         """Dispatch instantiation based on the supplied arguments."""
 
-        # Dispatch if subclasses exist
-        if cls.__subclasses__():
+        # Create instance if no subclasses
+        if not cls.__subclasses__():
+            return super().__call__(*args, **kw)
 
-            # Find applicable subclasses
-            passlist = []
-            for sc in cls.__subclasses__():
-                if sc._check_args(*args, **kw):
-                    passlist.append(sc)
+        # Preprocess arguments and keywords
+        args, kw = cls._preprocess_args(*args, **kw)
 
-            if len(passlist) == 0:
-                raise ValueError("No subclass supports the supplied arguments.")
-            if len(passlist) > 1:
-                raise ValueError("Degenerate subclasses found for the supplied arguments.")
+        # Find applicable subclasses
+        passlist = []
+        for subclass in cls.__subclasses__():
+            if subclass._check_args(*args, **kw):
+                passlist.append(subclass)
 
-            return passlist[0](*args, **kw)
-
-        # Otherwise create instance
+        if len(passlist) == 0:
+            return NotImplemented
+        elif len(passlist) > 1:
+            raise ValueError("Degenerate subclasses of {} found for the supplied arguments: {}, {}".format(cls, args, kw))
         else:
-            return type.__call__(cls, *args, **kw)
+            subclass, = passlist
+
+        # Postprocess arguments and keywords
+        args, kw = subclass._postprocess_args(*args, **kw)
+
+        return subclass(*args, **kw)
+
+    def _preprocess_args(cls, *args, **kw):
+        """Process arguments and keywords prior to checking dispatch."""
+        return args, kw
+
+    def _check_args(cls, *args, **kw):
+        """Check arguments and keywords to determine proper subclass for dispatch."""
+        return True
+
+    def _postprocess_args(cls, *args, **kw):
+        """Process arguments and keywords after checking dispatch."""
+        return args, kw
+
+
+class CachedMultiClass(MultiClass, CachedClass):
+    """Metaclass for dispatching and caching instantiantation to subclasses."""
+    pass
 

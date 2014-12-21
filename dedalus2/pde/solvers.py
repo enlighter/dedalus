@@ -9,11 +9,12 @@ import time
 from scipy.sparse import linalg
 from scipy.linalg import eig
 
-from ..data.operators import parsable_ops
+#from ..data.operators import parsable_ops
+from ..data import operators
 from ..data.evaluator import Evaluator
 from ..data.system import CoeffSystem, FieldSystem
 from ..data.pencil import build_pencils
-from ..data.field import Field
+from ..data.field import Scalar, Field
 from ..tools.progress import log_progress
 
 import logging
@@ -62,12 +63,12 @@ class LinearEigenvalue:
         self.pencils = build_pencils(domain)
 
         # Build systems
-        self.state = FieldSystem(problem.field_names, domain)
+        self.state = FieldSystem(problem.variables, domain)
 
         vars = dict()
         vars.update(parsable_ops)
         vars.update(zip(problem.diff_names, domain.diff_ops))
-        vars.update(zip(problem.axis_names, domain.grids()))
+        vars.update(zip(problem.axis_names, domain.grids(domain.dealias)))
         vars.update(problem.parameters)
         vars.update(self.state.field_dict)
 
@@ -132,7 +133,7 @@ class LinearBVP:
             pencil.build_matrices(problem, primary_basis)
 
         # Build systems
-        self.state = FieldSystem(problem.field_names, domain)
+        self.state = FieldSystem(problem.variables, domain)
 
         # Create F operator trees
         # Linear BVP: available terms are parse ops, diff ops, axes, and parameters
@@ -145,8 +146,10 @@ class LinearBVP:
         self.evaluator = Evaluator(domain, vars)
         Fe_handler = self.evaluator.add_system_handler(iter=1, group='F')
         Fb_handler = self.evaluator.add_system_handler(iter=1, group='F')
-        Fe_handler.add_tasks(problem.eqn_set['F'])
-        Fb_handler.add_tasks(problem.bc_set['F'])
+        for eqn in problem.eqs:
+            Fe_handler.add_task(eqn['raw_RHS'])
+        for bc in problem.bcs:
+            Fb_handler.add_task(bc['raw_RHS'])
         self.Fe = Fe_handler.build_system()
         self.Fb = Fb_handler.build_system()
 
@@ -206,48 +209,45 @@ class IVP:
 
         logger.debug('Beginning IVP instantiation')
 
-        # Assign axis names to bases
-        for i, b in enumerate(domain.bases):
-            b.name = problem.axis_names[i]
-
-        # Build pencils and pencil matrices
-        self.pencils = pencils = build_pencils(domain)
-        primary_basis = domain.bases[-1]
-        for p in log_progress(pencils, logger, 'info', desc='Building pencil matrix', iter=np.inf, frac=0.1, dt=10):
-            p.build_matrices(problem, primary_basis)
-
-        # Build systems
-        self.state = state = FieldSystem(problem.field_names, domain)
-
-        # Create F operator trees
-        # IVP: available terms are parse ops, diff ops, axes, parameters, and state
-        vars = dict()
-        vars.update(parsable_ops)
-        vars.update(zip(problem.diff_names, domain.diff_ops))
-        vars.update(zip(problem.axis_names, domain.grids()))
-        vars.update(problem.parameters)
-        vars.update(state.field_dict)
-
-        self._sim_time_field = Field(domain, name='sim_time')
-        self._sim_time_field.constant[:] = True
-        vars['t'] = self._sim_time_field
-
-        self.evaluator = Evaluator(domain, vars)
-        Fe_handler = self.evaluator.add_system_handler(iter=1, group='F')
-        Fb_handler = self.evaluator.add_system_handler(iter=1, group='F')
-        Fe_handler.add_tasks(problem.eqn_set['F'])
-        Fb_handler.add_tasks(problem.bc_set['F'])
-        self.Fe = Fe_handler.build_system()
-        self.Fb = Fb_handler.build_system()
-
-        # Initialize timestepper
-        self.timestepper = timestepper(problem.nfields, domain)
-
-        # Attributes
         self.problem = problem
         self.domain = domain
         self._wall_time_array = np.zeros(1, dtype=float)
         self.start_time = self.get_wall_time()
+
+        # Build pencils and pencil matrices
+        self.pencils = pencils = build_pencils(domain)
+        for p in log_progress(pencils, logger, 'info', desc='Building pencil matrix', iter=np.inf, frac=0.1, dt=10):
+            p.build_matrices(problem, ['M', 'L'])
+
+        # Build systems
+        self.state = state = FieldSystem(problem.variables, domain)
+        for var in problem.variables:
+            self.state[var].meta = problem.meta[var]
+            self.state[var].set_scales(1, keep_data=False)
+
+        # Create F operator trees
+        # IVP: available terms are parse ops, diff ops, axes, parameters, and state
+        namespace = problem.namespace.copy()
+        namespace.allow_overwrites()
+        namespace.update(state.field_dict)
+        namespace.add_substitutions(problem.substitutions)
+
+        self._sim_time = namespace[problem.time]
+
+        self.evaluator = Evaluator(domain, namespace)
+        Fe_handler = self.evaluator.add_system_handler(iter=1, group='F')
+        Fb_handler = self.evaluator.add_system_handler(iter=1, group='F')
+        for eqn in problem.eqs:
+            Fe_handler.add_task(eqn['raw_RHS'])
+        for bc in problem.bcs:
+            Fb_handler.add_task(bc['raw_RHS'])
+        self.Fe = Fe_handler.build_system()
+        self.Fb = Fb_handler.build_system()
+
+        # Initialize timestepper
+        self.timestepper = timestepper(problem.nvars, domain)
+
+        # Attributes
         self.sim_time = 0.
         self.iteration = 0
 
@@ -260,12 +260,11 @@ class IVP:
 
     @property
     def sim_time(self):
-        return self._sim_time
+        return self._sim_time.value
 
     @sim_time.setter
     def sim_time(self, t):
-        self._sim_time = t
-        self._sim_time_field['g'] = t
+        self._sim_time.value = t
 
     def get_wall_time(self):
         self._wall_time_array[0] = time.time()
