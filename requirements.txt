@@ -1,0 +1,9 @@
+cython
+docopt
+h5py >= 2.3.1
+hgapi
+matplotlib
+mpi4py
+numpy
+pathlib
+scipy >= 0.13.0
