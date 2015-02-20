@@ -1,9 +1,9 @@
 """
 Compute Bessel function by solving the Bessel equation:
 
-x**2 y_xx + x y_x + (x**2 - a**2) y = 0
-y(0) = 0
-y(30) = b
+x**2 f_xx + x f_x + (x**2 - A**2) f = 0
+f(0) = 0
+f(30) = B
 
 """
 
@@ -14,60 +14,45 @@ from ...public import *
 
 
 default_params = {}
-default_params['a'] = 2.
-default_params['b'] = 1.
+default_params['A'] = 2.
+default_params['B'] = 1.
 default_params['N'] = 65
 
 
 def dedalus_domain(N):
     """Construct Dedalus domain for solving the Airy equation."""
-
-    x_basis = Chebyshev(N, interval=(0., 30.))
+    x_basis = Chebyshev('x', N, interval=(0., 30.))
     domain = Domain([x_basis], grid_dtype=np.float64)
-
     return domain
 
 
-def dedalus_solution(a, b, N):
+def dedalus_solution(A, B, N):
     """Use Dedalus to solve the Airy equation."""
-
-    # Problem
-    bessel = ParsedProblem(axis_names=['x',],
-                           field_names=['y', 'yx'],
-                           param_names=['a', 'b'])
-    bessel.add_equation("x**2*dx(yx) + x*yx + (x**2 - a**2)*y = 0")
-    bessel.add_equation("dx(y) - yx = 0")
-    bessel.add_left_bc("y = 0")
-    bessel.add_right_bc("y = b")
-
     # Domain
     domain = dedalus_domain(N)
-
-    # Parameters
-    bessel.parameters['a'] = a
-    bessel.parameters['b'] = b
-    bessel.expand(domain, order=3)
-
+    # Problem
+    problem = BVP(domain, variables=['f', 'fx'])
+    problem.parameters['A'] = A
+    problem.parameters['B'] = B
+    problem.add_equation("x**2*dx(fx) + x*fx + (x**2 - A**2)*f = 0")
+    problem.add_equation("dx(f) - fx = 0")
+    problem.add_bc("left(f) = 0")
+    problem.add_bc("right(f) = B")
     # Solve
-    bvp = solvers.LinearBVP(bessel, domain)
-    bvp.solve()
+    solver = problem.build_solver()
+    solver.solve()
+    return np.copy(solver.state['f']['g'])
 
-    return np.copy(bvp.state['y']['g'])
 
-
-def exact_solution(a, b, N):
+def exact_solution(A, B, N):
     """Use scipy to construct exact solution to the Airy equation."""
-
     # Setup Dedalus domain to get same grid
     domain = dedalus_domain(N)
     x = domain.grid(0)
-
     # Compute Bessel function on grid
-    Jv = special.jv(a, x)
-
+    Jv = special.jv(A, x)
     # Solve for coefficient using boundary condition
-    c = b / Jv[0]
+    c = B / special.jv(A, 30)
     y_exact = c * Jv
-
     return y_exact
 

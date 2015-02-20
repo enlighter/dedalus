@@ -1,21 +1,23 @@
 """
-Simulation script for 2D Rayleigh-Benard convection.
+Dedalus script for 2D Rayleigh-Benard convection.
+
+This script uses a Fourier basis in the x direction with periodic boundary
+conditions.  The equations are scaled in units of the buoyancy time (Fr = 1).
 
 This script can be ran serially or in parallel, and uses the built-in analysis
-framework to save data snapshots in HDF5 files.  The `process.py` script in this
-folder can be used to merge distributed save files from parallel runs and plot
-the snapshots from the command line.
+framework to save data snapshots in HDF5 files.  The `merge.py` script in this
+folder can be used to merge distributed analysis sets from parallel runs,
+and the `plot_2d_series.py` script can be used to plot the snapshots.
 
-To run, join, and plot using 4 processes, for instance, you could use:
-$ mpiexec -n 4 python3 rayleigh_benard.py
-$ mpiexec -n 4 python3 process.py join snapshots
-$ mpiexec -n 4 python3 process.py plot snapshots/*.h5
+To run, merge, and plot using 4 processes, for instance, you could use:
+    $ mpiexec -n 4 python3 rayleigh_benard.py
+    $ mpiexec -n 4 python3 merge.py snapshots
+    $ mpiexec -n 4 python3 plot_2d_series.py snapshots/*.h5
 
-On a single process, this should take ~15 minutes to run.
+The simulation should take roughly 15 process-minutes to run.
 
 """
 
-import os
 import numpy as np
 from mpi4py import MPI
 import time
@@ -27,44 +29,38 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-# 2D Boussinesq hydrodynamics
-problem = de.ParsedProblem(axis_names=['x','z'],
-                           field_names=['p','b','u','w','bz','uz','wz'],
-                           param_names=['R','P','F'])
-problem.add_equation("dx(u) + wz = 0")
-problem.add_equation("dt(b) - P*(dx(dx(b)) + dz(bz))             = - u*dx(b) - w*bz")
-problem.add_equation("dt(u) - R*(dx(dx(u)) + dz(uz)) + dx(p)     = - u*dx(u) - w*uz")
-problem.add_equation("dt(w) - R*(dx(dx(w)) + dz(wz)) + dz(p) - b = - u*dx(w) - w*wz")
-problem.add_equation("bz - dz(b) = 0")
-problem.add_equation("uz - dz(u) = 0")
-problem.add_equation("wz - dz(w) = 0")
-problem.add_left_bc("b = -F*z")
-problem.add_left_bc("u = 0")
-problem.add_left_bc("w = 0")
-problem.add_right_bc("b = -F*z")
-problem.add_right_bc("u = 0")
-problem.add_right_bc("w = 0", condition="(dx != 0)")
-problem.add_int_bc("p = 0", condition="(dx == 0)")
-
 # Parameters
 Lx, Lz = (4., 1.)
 Prandtl = 1.
 Rayleigh = 1e6
 
 # Create bases and domain
-x_basis = de.Fourier(512, interval=(0, Lx), dealias=2/3)
-z_basis = de.Chebyshev(129, interval=(-Lz/2, Lz/2), dealias=2/3)
+x_basis = de.Fourier('x', 256, interval=(0, Lx), dealias=3/2)
+z_basis = de.Chebyshev('z', 64, interval=(-Lz/2, Lz/2), dealias=3/2)
 domain = de.Domain([x_basis, z_basis], grid_dtype=np.float64)
 
-# Finalize problem
+# 2D Boussinesq hydrodynamics
+problem = de.IVP(domain, variables=['p','b','u','w','bz','uz','wz'])
 problem.parameters['P'] = (Rayleigh * Prandtl)**(-1/2)
 problem.parameters['R'] = (Rayleigh / Prandtl)**(-1/2)
 problem.parameters['F'] = F = 1
-problem.expand(domain)
+problem.add_equation("dx(u) + wz = 0")
+problem.add_equation("dt(b) - P*(dx(dx(b)) + dz(bz))             = -(u*dx(b) + w*bz)")
+problem.add_equation("dt(u) - R*(dx(dx(u)) + dz(uz)) + dx(p)     = -(u*dx(u) + w*uz)")
+problem.add_equation("dt(w) - R*(dx(dx(w)) + dz(wz)) + dz(p) - b = -(u*dx(w) + w*wz)")
+problem.add_equation("bz - dz(b) = 0")
+problem.add_equation("uz - dz(u) = 0")
+problem.add_equation("wz - dz(w) = 0")
+problem.add_bc("left(b) = left(-F*z)")
+problem.add_bc("left(u) = 0")
+problem.add_bc("left(w) = 0")
+problem.add_bc("right(b) = right(-F*z)")
+problem.add_bc("right(u) = 0")
+problem.add_bc("right(w) = 0", condition="(nx != 0)")
+problem.add_bc("integ(p, 'z') = 0", condition="(nx == 0)")
 
 # Build solver
-ts = de.timesteppers.SBDF3
-solver = de.solvers.IVP(problem, domain, ts)
+solver = problem.build_solver(de.timesteppers.SBDF3)
 logger.info('Solver built')
 
 # Initial conditions
@@ -75,7 +71,8 @@ bz = solver.state['bz']
 
 # Linear background + perturbations damped at walls
 zb, zt = z_basis.interval
-pert =  1e-3 * np.random.standard_normal(domain.local_grid_shape) * (zt - z) * (z - zb)
+shape = domain.local_grid_shape(scales=1)
+pert =  1e-3 * np.random.standard_normal(shape) * (zt - z) * (z - zb)
 b['g'] = -F*(z - pert)
 b.differentiate('z', out=bz)
 
@@ -93,7 +90,7 @@ snapshots.add_task("w")
 
 # CFL
 CFL = flow_tools.CFL(solver, initial_dt=1e-3, cadence=5, safety=0.3,
-                     max_change=1.5, min_change=0.5)
+                     max_change=1.5, min_change=0.5, max_dt=0.05)
 CFL.add_velocities(('u', 'w'))
 
 # Flow properties

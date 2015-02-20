@@ -18,7 +18,7 @@ except ImportError:
     hgapi = None
 
 def check_env_var(env_var):
-    path = None 
+    path = None
     if env_var in os.environ:
         path = os.environ[env_var]
         print("  Found env var %s = %s" %(env_var, path))
@@ -66,7 +66,7 @@ def get_include(name):
     path = check_env_var(env_var)
     if path:
         return path
-        
+
     prefix = get_prefix(name)
     return os.path.join(prefix, 'include')
 
@@ -106,17 +106,33 @@ if hgapi:
 else:
     custom_build_ext = build_ext
 
-fftw_ext = Extension(
-    name='dedalus2.libraries.fftw.fftw_wrappers',
-    sources=['dedalus2/libraries/fftw/fftw_wrappers.pyx'],
-    include_dirs=['dedalus2/libraries/fftw/',
-                  np.get_include(),
-                  mpi4py.get_include(),
-                  get_include('fftw'),
-                  get_include('mpi')],
-    libraries=['fftw3_mpi', 'fftw3', 'm'],
-    library_dirs=[get_lib('fftw')]
-    )
+include_dirs = ['dedalus2/libraries/fftw/',
+                np.get_include(),
+                mpi4py.get_include(),
+                get_include('fftw'),
+                get_include('mpi')]
+
+libraries = ['fftw3_mpi',
+             'fftw3',
+             'm']
+
+library_dirs = [get_lib('fftw')]
+
+extensions = [
+    Extension(
+        name='dedalus2.libraries.fftw.fftw_wrappers',
+        sources=['dedalus2/libraries/fftw/fftw_wrappers.pyx'],
+        include_dirs=include_dirs,
+        libraries=libraries,
+        library_dirs=library_dirs,
+        extra_compile_args=["-Wno-error=declaration-after-statement"]),
+    Extension(
+        name='dedalus2.core.transposes',
+        sources=['dedalus2/core/transposes.pyx'],
+        include_dirs=include_dirs,
+        libraries=libraries,
+        library_dirs=library_dirs,
+        extra_compile_args=["-Wno-error=declaration-after-statement"])]
 
 setup(
     name='Dedalus',
@@ -125,10 +141,8 @@ setup(
     author_email='keaton.burns@gmail.com',
     license='GPL3',
     packages = ['dedalus2',
-                'dedalus2.data',
-                'dedalus2.pde',
+                'dedalus2.core',
                 'dedalus2.libraries',
                 'dedalus2.libraries.fftw'],
     cmdclass = {'build_ext': custom_build_ext},
-    ext_modules = cythonize([fftw_ext])
-    )
+    ext_modules = cythonize(extensions))

@@ -9,18 +9,19 @@ import time
 from scipy.sparse import linalg
 from scipy.linalg import eig
 
-from ..data.operators import parsable_ops
-from ..data.evaluator import Evaluator
-from ..data.system import CoeffSystem, FieldSystem
-from ..data.pencil import build_pencils
-from ..data.field import Field
+#from ..data.operators import parsable_ops
+from . import operators
+from . import pencil
+from .evaluator import Evaluator
+from .system import CoeffSystem, FieldSystem
+from .field import Scalar, Field
 from ..tools.progress import log_progress
 
 import logging
 logger = logging.getLogger(__name__.split('.')[-1])
 
 
-class LinearEigenvalue:
+class EigenvalueSolver:
     """
     Solves linear eigenvalue problems for oscillation frequency omega, (d_t -> -i omega).
     First converts to dense matrices, then solves the eigenvalue problem for a given pencil,
@@ -31,8 +32,6 @@ class LinearEigenvalue:
     ----------
     problem : problem object
         Problem describing system of differential equations and constraints
-    domain : domain object
-        Problem domain
 
     Attributes
     ----------
@@ -48,43 +47,33 @@ class LinearEigenvalue:
 
     """
 
-    def __init__(self, problem, domain):
+    def __init__(self, problem):
 
-        # Store references to problem & domain
+        logger.debug('Beginning EVP instantiation')
+
         self.problem = problem
-        self.domain = domain
+        self.domain = domain = problem.domain
 
-        # Assign axis names to bases
-        for i, b in enumerate(domain.bases):
-            b.name = problem.axis_names[i]
-
-        # Build pencils
+        # Build pencils and pencil matrices
         self.pencils = build_pencils(domain)
 
         # Build systems
-        self.state = FieldSystem(problem.field_names, domain)
+        namespace = problem.namespace
+        vars = [namespace[var] for var in problem.variables]
+        self.state = FieldSystem.from_fields(vars)
 
-        vars = dict()
-        vars.update(parsable_ops)
-        vars.update(zip(problem.diff_names, domain.diff_ops))
-        vars.update(zip(problem.axis_names, domain.grids()))
-        vars.update(problem.parameters)
-        vars.update(self.state.field_dict)
+        # Create F operator trees
+        self.evaluator = Evaluator(domain, namespace)
 
-        self.evaluator = Evaluator(domain, vars)
+        logger.debug('Finished EVP instantiation')
 
     def solve(self, pencil):
-        """Solve BVP."""
-
+        """Solve EVP."""
         self.eigenvalue_pencil = pencil
-
-        # Build matrices
-        primary_basis = self.domain.bases[-1]
-        pencil.build_matrices(self.problem, primary_basis)
-
+        pencil.build_matrices(self.problem, ['M', 'L'])
         L = pencil.L.todense()
         M = pencil.M.todense()
-        self.eigenvalues, self.eigenvectors = eig(-1j*L,b=M)
+        self.eigenvalues, self.eigenvectors = eig(L, b=-M)
 
     def set_state(self, num):
         """Set state vector to the num-th eigenvector"""
@@ -97,7 +86,7 @@ class LinearEigenvalue:
         self.state.scatter()
 
 
-class LinearBVP:
+class LinearBoundaryValueSolver:
     """
     Linear boundary value problem solver.
 
@@ -105,53 +94,42 @@ class LinearBVP:
     ----------
     problem : problem object
         Problem describing system of differential equations and constraints
-    domain : domain object
-        Problem domain
 
     Attributes
     ----------
     state : system object
         System containing solution fields (after solve method is called)
 
-    Notes
-    -----
-    Any problem terms with time derivatives will be dropped.
-
     """
 
-    def __init__(self, problem, domain):
+    def __init__(self, problem):
 
-        # Assign axis names to bases
-        for i, b in enumerate(domain.bases):
-            b.name = problem.axis_names[i]
+        logger.debug('Beginning LBVP instantiation')
+
+        self.problem = problem
+        self.domain = domain = problem.domain
 
         # Build pencils and pencil matrices
-        self.pencils = pencils = build_pencils(domain)
-        primary_basis = domain.bases[-1]
-        for pencil in log_progress(pencils, logger, 'info', desc='Building pencil matrix', iter=np.inf, frac=0.1, dt=10):
-            pencil.build_matrices(problem, primary_basis)
+        self.pencils = pencil.build_pencils(domain)
+        pencil.build_matrices(self.pencils, problem, ['L'])
 
         # Build systems
-        self.state = FieldSystem(problem.field_names, domain)
+        namespace = problem.namespace
+        vars = [namespace[var] for var in problem.variables]
+        self.state = FieldSystem.from_fields(vars)
 
         # Create F operator trees
-        # Linear BVP: available terms are parse ops, diff ops, axes, and parameters
-        vars = dict()
-        vars.update(parsable_ops)
-        vars.update(zip(problem.diff_names, domain.diff_ops))
-        vars.update(zip(problem.axis_names, domain.grids()))
-        vars.update(problem.parameters)
-
-        self.evaluator = Evaluator(domain, vars)
+        self.evaluator = Evaluator(domain, namespace)
         Fe_handler = self.evaluator.add_system_handler(iter=1, group='F')
         Fb_handler = self.evaluator.add_system_handler(iter=1, group='F')
-        Fe_handler.add_tasks(problem.eqn_set['F'])
-        Fb_handler.add_tasks(problem.bc_set['F'])
+        for eqn in problem.eqs:
+            Fe_handler.add_task(eqn['F'])
+        for bc in problem.bcs:
+            Fb_handler.add_task(bc['F'])
         self.Fe = Fe_handler.build_system()
         self.Fb = Fb_handler.build_system()
 
-        # Allow users to access state variables for analysis, but not for the RHS of the BVP.
-        vars.update(self.state.field_dict)
+        logger.debug('Finished LBVP instantiation')
 
     def solve(self):
         """Solve BVP."""
@@ -170,7 +148,77 @@ class LinearBVP:
         self.state.scatter()
 
 
-class IVP:
+class NonlinearBoundaryValueSolver:
+    """
+    Nonlinear boundary value problem solver.
+
+    Parameters
+    ----------
+    problem : problem object
+        Problem describing system of differential equations and constraints
+
+    Attributes
+    ----------
+    state : system object
+        System containing solution fields (after solve method is called)
+
+    """
+
+    def __init__(self, problem):
+
+        logger.debug('Beginning NLBVP instantiation')
+
+        self.problem = problem
+        self.domain = domain = problem.domain
+        self.iteration = 0
+
+        # Build pencils and pencil matrices
+        self.pencils = pencil.build_pencils(domain)
+        pencil.build_matrices(self.pencils, problem, ['L', 'dF'])
+
+        # Build systems
+        namespace = problem.namespace
+        vars = [namespace[var] for var in problem.variables]
+        perts = [namespace['δ'+var] for var in problem.variables]
+        self.state = FieldSystem.from_fields(vars)
+        self.perturbations = FieldSystem.from_fields(perts)
+
+        # Create F operator trees
+        self.evaluator = Evaluator(domain, namespace)
+        Fe_handler = self.evaluator.add_system_handler(iter=1, group='F')
+        Fb_handler = self.evaluator.add_system_handler(iter=1, group='F')
+        for eqn in problem.eqs:
+            Fe_handler.add_task(eqn['F-L'])
+        for bc in problem.bcs:
+            Fb_handler.add_task(bc['F-L'])
+        self.Fe = Fe_handler.build_system()
+        self.Fb = Fb_handler.build_system()
+
+        logger.debug('Finished NLBVP instantiation')
+
+    def newton_iteration(self):
+        """Update solution with a Newton iteration."""
+        # Compute RHS
+        self.evaluator.evaluate_group('F', 0, 0, 0)
+        # Recompute Jacobian
+        pencil.build_matrices(self.pencils, self.problem, ['dF'])
+        # Solve system for each pencil, updating perturbations
+        for p in self.pencils:
+            pFe = self.Fe.get_pencil(p)
+            pFb = self.Fb.get_pencil(p)
+            A = p.L - p.dF
+            b = p.G_eq * pFe + p.G_bc * pFb
+            x = linalg.spsolve(A, b, use_umfpack=False, permc_spec='NATURAL')
+            self.perturbations.set_pencil(p, x)
+        self.perturbations.scatter()
+        # Update state
+        self.state.gather()
+        self.state.data += self.perturbations.data
+        self.state.scatter()
+        self.iteration += 1
+
+
+class InitialValueSolver:
     """
     Initial value problem solver.
 
@@ -178,8 +226,6 @@ class IVP:
     ----------
     problem : problem object
         Problem describing system of differential equations and constraints
-    domain : domain object
-        Problem domain
     timestepper : timestepper class
         Timestepper to use in evolving initial conditions
 
@@ -202,52 +248,40 @@ class IVP:
 
     """
 
-    def __init__(self, problem, domain, timestepper):
+    def __init__(self, problem, timestepper):
 
         logger.debug('Beginning IVP instantiation')
 
-        # Assign axis names to bases
-        for i, b in enumerate(domain.bases):
-            b.name = problem.axis_names[i]
+        self.problem = problem
+        self.domain = domain = problem.domain
+        self._wall_time_array = np.zeros(1, dtype=float)
+        self.start_time = self.get_wall_time()
 
         # Build pencils and pencil matrices
-        self.pencils = pencils = build_pencils(domain)
-        primary_basis = domain.bases[-1]
-        for p in log_progress(pencils, logger, 'info', desc='Building pencil matrix', iter=np.inf, frac=0.1, dt=10):
-            p.build_matrices(problem, primary_basis)
+        self.pencils = pencil.build_pencils(domain)
+        pencil.build_matrices(self.pencils, problem, ['M', 'L'])
 
         # Build systems
-        self.state = state = FieldSystem(problem.field_names, domain)
+        namespace = problem.namespace
+        vars = [namespace[var] for var in problem.variables]
+        self.state = FieldSystem.from_fields(vars)
+        self._sim_time = namespace[problem.time]
 
         # Create F operator trees
-        # IVP: available terms are parse ops, diff ops, axes, parameters, and state
-        vars = dict()
-        vars.update(parsable_ops)
-        vars.update(zip(problem.diff_names, domain.diff_ops))
-        vars.update(zip(problem.axis_names, domain.grids()))
-        vars.update(problem.parameters)
-        vars.update(state.field_dict)
-
-        self._sim_time_field = Field(domain, name='sim_time')
-        self._sim_time_field.constant[:] = True
-        vars['t'] = self._sim_time_field
-
-        self.evaluator = Evaluator(domain, vars)
+        self.evaluator = Evaluator(domain, namespace)
         Fe_handler = self.evaluator.add_system_handler(iter=1, group='F')
         Fb_handler = self.evaluator.add_system_handler(iter=1, group='F')
-        Fe_handler.add_tasks(problem.eqn_set['F'])
-        Fb_handler.add_tasks(problem.bc_set['F'])
+        for eqn in problem.eqs:
+            Fe_handler.add_task(eqn['F'])
+        for bc in problem.bcs:
+            Fb_handler.add_task(bc['F'])
         self.Fe = Fe_handler.build_system()
         self.Fb = Fb_handler.build_system()
 
         # Initialize timestepper
-        self.timestepper = timestepper(problem.nfields, domain)
+        self.timestepper = timestepper(problem.nvars, domain)
 
         # Attributes
-        self.problem = problem
-        self.domain = domain
-        self._wall_time_array = np.zeros(1, dtype=float)
-        self.start_time = self.get_wall_time()
         self.sim_time = 0.
         self.iteration = 0
 
@@ -260,12 +294,11 @@ class IVP:
 
     @property
     def sim_time(self):
-        return self._sim_time
+        return self._sim_time.value
 
     @sim_time.setter
     def sim_time(self, t):
-        self._sim_time = t
-        self._sim_time_field['g'] = t
+        self._sim_time.value = t
 
     def get_wall_time(self):
         self._wall_time_array[0] = time.time()
@@ -326,4 +359,5 @@ class IVP:
             if self.sim_time + dt > self.stop_sim_time:
                 dt = self.stop_sim_time - self.sim_time
             self.step(dt)
+
 
