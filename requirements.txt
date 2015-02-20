@@ -1,4 +1,4 @@
-cython
+cython >=0.22
 docopt
 h5py >= 2.3.1
 hgapi
@@ -7,4 +7,3 @@ mpi4py
 numpy
 pathlib
 scipy >= 0.13.0
-sympy

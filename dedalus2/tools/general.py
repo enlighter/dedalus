@@ -42,3 +42,26 @@ def natural_sort(iterable, reverse=False):
 
     return sorted(iterable, key=key, reverse=reverse)
 
+
+def oscillate(iterable):
+    """Oscillate forward and backward through an iterable."""
+
+    forward = iterable
+    backward = iterable[::-1][1:-1]  # Weird slicing to work with range
+    while True:
+        yield from forward
+        yield from backward
+
+
+def unify(objects):
+    """
+    Check if all objects in a collection are equal.
+    If so, return one of them.  If not, raise.
+    """
+    for i, object in enumerate(objects):
+        if i == 0:
+            OBJECT = object
+        else:
+            if object != OBJECT:
+                raise ValueError("Objects are not all equal.")
+    return OBJECT

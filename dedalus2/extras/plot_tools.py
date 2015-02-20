@@ -3,55 +3,110 @@
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
+from matplotlib import ticker
+from matplotlib import transforms
 
+from ..core.field import Field
 from ..tools.array import reshape_vector
 
 
-def plot_bot(field, image_axes, data_slices, clim=None, cmap='RdBu_r', figkw={}):
+class FieldWrapper:
+    """Class to mimic h5py dataset interface for Dedalus fields."""
+
+    def __init__(self, field):
+        self.field = field
+        self.attrs = {'name': field.name}
+        self.dims = [DimWrapper(field, axis) for axis in range(field.domain.dim)]
+
+    def __getitem__(self, item):
+        return self.field.data[item]
+
+    @property
+    def shape(self):
+        return self.field.data.shape
+
+
+class DimWrapper:
+    """Wrapper class to mimic h5py dimension scales."""
+
+    def __init__(self, field, axis):
+        self.field = field
+        self.axis = axis
+        self.basis = field.domain.bases[axis]
+
+    @property
+    def label(self):
+        if self.field.layout.grid_space[self.axis]:
+            return self.basis.name
+        else:
+            return self.basis.element_name
+
+    def __getitem__(self, item):
+        if self.field.layout.grid_space[self.axis]:
+            scale = self.field.meta[self.axis]['scale']
+            return self.basis.grid(scale)
+        else:
+            return self.basis.elements
+
+
+def plot_bot(dset, image_axes, data_slices, clim=None, even_scale=False, cmap='RdBu_r', axes=None, figkw={}, title=None, func=None):
     """
-    Plot a 2d slice of the grid data of a field.
+    Plot a 2d slice of the grid data of a dset/field.
 
     Parameters
     ----------
-    field : field object
-        Field to plot
+    dset : h5py dset or Dedalus Field object
+        Dataset to plot
     image_axes: tuple of ints (xi, yi)
         Data axes to use for image x and y axes
     data_slices: tuple of slices, ints
         Slices selecting image data from global data
     clim : tuple of floats, optional
         Colorbar limits (default: (data min, data max))
+    even_scale : bool, optional
+        Expand colorbar limits to be symmetric around 0 (default: False)
     cmap : str, optional
         Colormap name (default: 'RdBu_r')
+    axes : matplotlib.Axes object, optional
+        Axes to overplot.  If None (default), a new figure and axes will be created.
     figkw : dict, optional
         Keyword arguments to pass to plt.figure (default: {})
+    title : str, optional
+        Title for plot (default: dataset name)
+    func : function, optional
+        Function to apply to selected data before plotting (default: None)
 
     """
+
+    # Wrap fields
+    if isinstance(dset, Field):
+        dset = FieldWrapper(dset)
 
     # Unpack image axes
     xaxis, yaxis = image_axes
 
-    # Select grids and data
-    xgrid = field.domain.bases[xaxis].grid[data_slices[xaxis]]
-    ygrid = field.domain.bases[yaxis].grid[data_slices[yaxis]]
-    data = field['g'][data_slices]
-
-    # Create well-ordered meshes
-    xorder = np.argsort(xgrid)
-    yorder = np.argsort(ygrid)
-    xmesh, ymesh = quad_mesh(xgrid[xorder], ygrid[yorder])
-
-    # Arrange data to match sorted meshes
-    if xaxis < yaxis:
-        data = data.T
-    data = data[yorder]
-    data = data[:, xorder]
+    # Get meshes and data
+    xmesh, ymesh, data = get_plane(dset, xaxis, yaxis, data_slices)
+    if func is not None:
+        data = func(data)
 
     # Setup figure
-    fig = plt.figure(**figkw)
-    paxes = fig.add_axes([0.1, 0.1, 0.8, 0.75])
-    caxes = fig.add_axes([0.1, 0.86, 0.8, 0.04])
+    if axes is None:
+        fig = plt.figure(**figkw)
+        axes = fig.add_subplot(1, 1, 1)
+
+    # Setup axes
+    # Bounds (left, bottom, width, height) relative-to-axes
+    pbbox = transforms.Bbox.from_bounds(0.03, 0, 0.94, 0.94)
+    cbbox = transforms.Bbox.from_bounds(0.03, 0.95, 0.94, 0.05)
+    # Convert to relative-to-figure
+    to_axes_bbox = transforms.BboxTransformTo(axes.get_position())
+    pbbox = pbbox.transformed(to_axes_bbox)
+    cbbox = cbbox.transformed(to_axes_bbox)
+    # Create new axes and suppress base axes
+    paxes = axes.figure.add_axes(pbbox)
+    caxes = axes.figure.add_axes(cbbox)
+    axes.axis('off')
 
     # Colormap options
     cmap = matplotlib.cm.get_cmap(cmap)
@@ -62,25 +117,32 @@ def plot_bot(field, image_axes, data_slices, clim=None, cmap='RdBu_r', figkw={})
     paxes.axis(pad_limits(xmesh, ymesh))
     paxes.tick_params(length=0, width=0)
     if clim is None:
-        clim = (data.min(), data.max())
+        if even_scale:
+            lim = max(abs(data.min()), abs(data.max()))
+            clim = (-lim, lim)
+        else:
+            clim = (data.min(), data.max())
     plot.set_clim(*clim)
 
     # Colorbar
-    cbar = fig.colorbar(plot, cax=caxes, orientation='horizontal',
+    cbar = plt.colorbar(plot, cax=caxes, orientation='horizontal',
         ticks=ticker.MaxNLocator(nbins=5))
     cbar.outline.set_visible(False)
     caxes.xaxis.set_ticks_position('top')
 
     # Labels
-    caxes.set_xlabel(field.name)
+    if title is None:
+        try:
+            title = dset.attrs['name']
+        except KeyError:
+            title = dset.name
+    caxes.set_xlabel(title)
     caxes.xaxis.set_label_position('top')
-    paxes.set_ylabel(field.domain.bases[yaxis].name)
-    paxes.set_xlabel(field.domain.bases[xaxis].name)
-
-    return fig
+    paxes.set_ylabel(dset.dims[yaxis].label)
+    paxes.set_xlabel(dset.dims[xaxis].label)
 
 
-def plot_bot_2d(field, transpose=False, **kw):
+def plot_bot_2d(dset, transpose=False, **kw):
     """
     Plot the grid data of a 2d field.
 
@@ -90,18 +152,18 @@ def plot_bot_2d(field, transpose=False, **kw):
         Field to plot
     transpose : bool, optional
         Flag for transposing plot (default: False)
-    clim : tuple of floats, optional
-        Colorbar limits (default: (data min, data max))
-    cmap : str, optional
-        Colormap name (default: 'RdBu_r')
-    figkw : dict, optional
-        Keyword arguments to pass to plt.figure (default: {})
+
+    Other keyword arguments are passed on to plot_bot.
 
     """
 
+    # Wrap fields
+    if isinstance(dset, Field):
+        dset = FieldWrapper(dset)
+
     # Check dimension
-    if field.domain.dim != 2:
-        raise ValueError("This function is for plotting 2d fields only.")
+    if len(dset.shape) != 2:
+        raise ValueError("This function is for plotting 2d datasets only.")
 
     # Call general plotting function
     image_axes = (0, 1)
@@ -109,10 +171,10 @@ def plot_bot_2d(field, transpose=False, **kw):
         image_axes = image_axes[::-1]
     data_slices = (slice(None), slice(None))
 
-    return plot_bot(field, image_axes, data_slices, **kw)
+    return plot_bot(dset, image_axes, data_slices, **kw)
 
 
-def plot_bot_3d(field, normal_axis, normal_index, transpose=False, **kw):
+def plot_bot_3d(dset, normal_axis, normal_index, transpose=False, **kw):
     """
     Plot a 2d slice of the grid data of a 3d field.
 
@@ -126,24 +188,24 @@ def plot_bot_3d(field, normal_axis, normal_index, transpose=False, **kw):
         Index along normal direction to plot
     transpose : bool, optional
         Flag for transposing plot (default: False)
-    clim : tuple of floats, optional
-        Colorbar limits (default: (data min, data max))
-    cmap : str, optional
-        Colormap name (default: 'RdBu_r')
-    figkw : dict, optional
-        Keyword arguments to pass to plt.figure (default: {})
+
+    Other keyword arguments are passed on to plot_bot.
 
     """
 
+    # Wrap fields
+    if isinstance(dset, Field):
+        dset = FieldWrapper(dset)
+
     # Check dimension
-    if field.domain.dim != 3:
-        raise ValueError("This function is for plotting 3d fields only.")
+    if len(dset.shape) != 3:
+        raise ValueError("This function is for plotting 3d datasets only.")
 
     # Resolve axis name to axis index
     if isinstance(normal_axis, str):
-        for a, b in enumerate(field.domain.bases):
-            if normal_axis == b.name:
-                normal_axis = a
+        for axis, dim in enumerate(dset.dims):
+            if normal_axis == dim.label:
+                normal_axis = axis
                 break
         else:
             raise ValueError("Axis name not found.")
@@ -156,7 +218,7 @@ def plot_bot_3d(field, normal_axis, normal_index, transpose=False, **kw):
     data_slices = [slice(None), slice(None), slice(None)]
     data_slices[normal_axis] = normal_index
 
-    return plot_bot(field, image_axes, tuple(data_slices), **kw)
+    return plot_bot(dset, image_axes, tuple(data_slices), **kw)
 
 
 class MultiFigure:
@@ -472,6 +534,9 @@ def get_plane(dset, xaxis, yaxis, slices, **kw):
     Other keywords passed to quad_mesh
 
     """
+
+    # Make sure slices are in tuple
+    slices = tuple(slices)
 
     # Build quad meshes from sorted grids
     xgrid = dset.dims[xaxis][0][slices[xaxis]]
